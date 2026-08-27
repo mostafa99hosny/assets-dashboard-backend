@@ -6,6 +6,8 @@ import {
   getProjectAssetDetail,
   getProjectAssets,
   getProjectFilterOptions,
+  getProjectFolderMetrics,
+  getProjectInsights,
   getProjectMetadata,
   getProjectOverview,
 } from "../services/dashboard.service";
@@ -44,6 +46,28 @@ projectsRouter.get(
   asyncHandler(async (request, response) => {
     const overview = await getProjectOverview(projectId(request));
     return sendData(response, 200, overview, { generatedAt: new Date().toISOString() });
+  }),
+);
+
+projectsRouter.get(
+  "/projects/:id/insights",
+  asyncHandler(async (request, response) => {
+    const insights = await getProjectInsights(
+      projectId(request),
+      parseAssetFilters(query(request)),
+    );
+    return sendData(response, 200, insights, { generatedAt: new Date().toISOString() });
+  }),
+);
+
+projectsRouter.get(
+  "/projects/:id/folder-metrics",
+  asyncHandler(async (request, response) => {
+    const result = await getProjectFolderMetrics(
+      projectId(request),
+      parseAssetFilters(query(request)),
+    );
+    return sendData(response, 200, result, { generatedAt: new Date().toISOString() });
   }),
 );
 

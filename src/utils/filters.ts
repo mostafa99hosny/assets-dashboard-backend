@@ -13,11 +13,14 @@ export interface AssetQueryFilters {
   categories: string[];
   types: string[];
   employers: string[];
+  locations: string[];
   statuses: string[];
   isPresent?: boolean;
   isDone?: boolean;
   hasNotes?: boolean;
+  hasCode?: boolean;
   folderId?: ObjectId;
+  folderIds: ObjectId[];
   includeDescendants: boolean;
   updatedFrom?: Date;
   updatedTo?: Date;
@@ -193,7 +196,15 @@ export function parseAssetFilters(query: Record<string, QueryValue>): AssetQuery
     throw new ValidationError("sortDir must be asc or desc.");
   }
 
-  const folderIdText = singleString(query.folderId, "folderId");
+  const folderIdTexts = [
+    ...stringValues(query.folderId, "folderId"),
+    ...stringValues(query.folderIds, "folderIds"),
+  ];
+  const uniqueFolderIdTexts = [...new Set(folderIdTexts)];
+  if (uniqueFolderIdTexts.length > MAX_FILTER_VALUES) {
+    throw new ValidationError(`folderId accepts at most ${MAX_FILTER_VALUES} values.`);
+  }
+  const folderIds = uniqueFolderIdTexts.map((value) => parseObjectId(value, "folderId"));
 
   return {
     q,
@@ -202,11 +213,16 @@ export function parseAssetFilters(query: Record<string, QueryValue>): AssetQuery
     categories: stringValues(query.category ?? query.categories, "category"),
     types: stringValues(query.type ?? query.types, "type"),
     employers: stringValues(query.employer ?? query.employers, "employer"),
+    locations: stringValues(query.location ?? query.locations, "location"),
     statuses: stringValues(query.status ?? query.statuses, "status"),
     isPresent: optionalBoolean(query.isPresent ?? query.present, "isPresent"),
     isDone: optionalBoolean(query.isDone ?? query.done, "isDone"),
     hasNotes: optionalBoolean(query.hasNotes, "hasNotes"),
-    folderId: folderIdText ? parseObjectId(folderIdText, "folderId") : undefined,
+    hasCode: optionalBoolean(query.hasCode, "hasCode"),
+    // Keep the singular field for older consumers while all new matching uses
+    // the full union in `folderIds`.
+    folderId: folderIds[0],
+    folderIds,
     includeDescendants: optionalBoolean(query.includeDescendants, "includeDescendants") ?? true,
     updatedFrom,
     updatedTo,
@@ -247,13 +263,16 @@ export function publicFilters(filters: AssetQueryFilters): Record<string, unknow
     category: filters.categories,
     type: filters.types,
     employer: filters.employers,
+    location: filters.locations,
     status: filters.statuses,
     isPresent: filters.isPresent ?? null,
     present: filters.isPresent ?? null,
     isDone: filters.isDone ?? null,
     done: filters.isDone ?? null,
     hasNotes: filters.hasNotes ?? null,
+    hasCode: filters.hasCode ?? null,
     folderId: filters.folderId?.toHexString() ?? null,
+    folderIds: filters.folderIds.map((folderId) => folderId.toHexString()),
     includeDescendants: filters.includeDescendants,
     updatedFrom: filters.updatedFrom?.toISOString() ?? null,
     updatedTo: filters.updatedTo?.toISOString() ?? null,

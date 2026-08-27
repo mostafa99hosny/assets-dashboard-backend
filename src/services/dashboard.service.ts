@@ -2,7 +2,7 @@ import { type Document, ObjectId } from "mongodb";
 
 import { env } from "../config/env";
 import { getDatabase } from "../db/mongo";
-import { NotFoundError } from "../errors/app-error";
+import { NotFoundError, ValidationError } from "../errors/app-error";
 import {
   type AssetQueryFilters,
   escapeRegex,
@@ -98,6 +98,46 @@ function assetBaseMatch(projectId: ObjectId): Document {
   };
 }
 
+function appendExpression(match: Document, expression: Document): void {
+  const existingExpression = match.$expr;
+  match.$expr = existingExpression
+    ? { $and: [existingExpression, expression] }
+    : expression;
+}
+
+function normalizedLocationExpression(): Document {
+  return { $ifNull: ["$newAssetLocation", "$asset_location"] };
+}
+
+function nonBlankFieldExpression(field: string): Document {
+  return {
+    $ne: [
+      {
+        $trim: {
+          input: {
+            $convert: {
+              input: `$${field}`,
+              to: "string",
+              onError: "",
+              onNull: "",
+            },
+          },
+        },
+      },
+      "",
+    ],
+  };
+}
+
+function hasCodeExpression(): Document {
+  return {
+    $or: [
+      nonBlankFieldExpression("code"),
+      nonBlankFieldExpression("client_code"),
+    ],
+  };
+}
+
 async function getProjectForDefaultCompany(projectId: ObjectId): Promise<PlainRecord> {
   const database = await getDatabase();
   const project = await database
@@ -150,49 +190,75 @@ async function getDefaultCompany(): Promise<PlainRecord> {
 
 async function resolveFolderIds(
   projectId: ObjectId,
-  folderId: ObjectId,
+  folderIds: readonly ObjectId[],
   includeDescendants: boolean,
 ): Promise<ObjectId[]> {
   const database = await getDatabase();
-
-  const pipeline: Document[] = [
-    { $match: { _id: folderId, projectId } },
-  ];
-
-  if (includeDescendants) {
-    pipeline.push({
-      $graphLookup: {
-        from: COLLECTION.items,
-        startWith: "$_id",
-        connectFromField: "_id",
-        connectToField: "parent",
-        as: "descendants",
-        restrictSearchWithMatch: { projectId },
-        maxDepth: 20,
-      },
-    });
-    pipeline.push({
-      $project: {
-        ids: { $concatArrays: [["$_id"], "$descendants._id"] },
-      },
-    });
-  } else {
-    pipeline.push({ $project: { ids: ["$_id"] } });
-  }
-
-  const result = await database
-    .collection<Document>(COLLECTION.items)
-    .aggregate(pipeline, QUERY_OPTIONS)
-    .next();
-
-  if (!result) {
+  const uniqueFolderIds = [...new Map(
+    folderIds.map((folderId) => [folderId.toHexString(), folderId]),
+  ).values()];
+  if (uniqueFolderIds.length === 0) {
     throw new NotFoundError("Folder not found in this project.");
   }
 
-  const ids = asRecord(result).ids;
-  return Array.isArray(ids)
-    ? ids.filter((entry): entry is ObjectId => entry instanceof ObjectId)
-    : [];
+  const folders = await database
+    .collection<Document>(COLLECTION.items)
+    .find(
+      { _id: { $in: uniqueFolderIds }, projectId },
+      { projection: { _id: 1 }, maxTimeMS: env.mongoQueryTimeoutMs },
+    )
+    .toArray();
+
+  if (folders.length !== uniqueFolderIds.length) {
+    throw new NotFoundError("Folder not found in this project.");
+  }
+
+  const roots = folders
+    .map((folder) => folder._id)
+    .filter((folderId): folderId is ObjectId => folderId instanceof ObjectId);
+
+  if (!includeDescendants) {
+    return roots;
+  }
+
+  const trees = await database
+    .collection<Document>(COLLECTION.items)
+    .aggregate(
+      [
+        { $match: { _id: { $in: roots }, projectId } },
+        {
+          $graphLookup: {
+            from: COLLECTION.items,
+            startWith: "$_id",
+            connectFromField: "_id",
+            connectToField: "parent",
+            as: "descendants",
+            restrictSearchWithMatch: { projectId },
+            maxDepth: 20,
+          },
+        },
+        { $project: { _id: 1, "descendants._id": 1 } },
+      ],
+      QUERY_OPTIONS,
+    )
+    .toArray();
+
+  const ids = new Map<string, ObjectId>();
+  for (const tree of trees) {
+    if (tree._id instanceof ObjectId) {
+      ids.set(tree._id.toHexString(), tree._id);
+    }
+
+    const descendants = Array.isArray(tree.descendants) ? tree.descendants : [];
+    for (const descendant of descendants) {
+      const id = asRecord(descendant)._id;
+      if (id instanceof ObjectId) {
+        ids.set(id.toHexString(), id);
+      }
+    }
+  }
+
+  return [...ids.values()];
 }
 
 async function buildAssetMatch(
@@ -202,7 +268,9 @@ async function buildAssetMatch(
   const match = assetBaseMatch(projectId);
 
   if (filters.sources.length > 0) {
-    match.asset_source = { $in: filters.sources };
+    appendExpression(match, {
+      $in: [{ $ifNull: ["$asset_source", "$source"] }, filters.sources],
+    });
   }
   if (filters.conditions.length > 0) {
     match.condition = { $in: filters.conditions };
@@ -216,6 +284,11 @@ async function buildAssetMatch(
   if (filters.employers.length > 0) {
     match.employer = { $in: filters.employers };
   }
+  if (filters.locations.length > 0) {
+    appendExpression(match, {
+      $in: [normalizedLocationExpression(), filters.locations],
+    });
+  }
   if (filters.statuses.length > 0) {
     match.status = { $in: filters.statuses };
   }
@@ -228,22 +301,121 @@ async function buildAssetMatch(
   if (filters.hasNotes !== undefined) {
     match.hasNotes = filters.hasNotes;
   }
+  if (filters.hasCode !== undefined) {
+    const codeExpression = hasCodeExpression();
+    appendExpression(
+      match,
+      filters.hasCode ? codeExpression : { $not: [codeExpression] },
+    );
+  }
   if (filters.updatedFrom || filters.updatedTo) {
     match.updatedAt = {
       ...(filters.updatedFrom ? { $gte: filters.updatedFrom } : {}),
       ...(filters.updatedTo ? { $lte: filters.updatedTo } : {}),
     };
   }
-  if (filters.folderId) {
+  const configuredFolderIds = Array.isArray(filters.folderIds) ? filters.folderIds : [];
+  const requestedFolderIds = configuredFolderIds.length > 0
+    ? configuredFolderIds
+    : filters.folderId ? [filters.folderId] : [];
+  if (requestedFolderIds.length > 0) {
     const folderIds = await resolveFolderIds(
       projectId,
-      filters.folderId,
+      requestedFolderIds,
       filters.includeDescendants,
     );
     match.parent = { $in: folderIds };
   }
 
   return match;
+}
+
+// Keep the expression bounded so a malformed or unusually deep import cannot
+// create an unbounded aggregation expression. Eight levels comfortably covers
+// the imported `rawData`, `normalizedData`, images, and descriptions while
+// remaining a single server-side aggregation expression (no `$where` or
+// server-side JavaScript is used).
+const SEARCH_DOCUMENT_MAX_DEPTH = 8;
+
+/**
+ * Converts an arbitrary BSON value into searchable text. Embedded documents
+ * and arrays are traversed recursively, so search is not limited to the small
+ * set of fields rendered in the table. Scalars such as ObjectIds, numbers,
+ * booleans, and dates are converted safely; unsupported BSON values simply do
+ * not add text to the search index for that document.
+ */
+function searchableTextExpression(input: string, depth: number): Document {
+  const scalarText: Document = {
+    $convert: {
+      input,
+      to: "string",
+      onError: "",
+      onNull: "",
+    },
+  };
+
+  if (depth <= 0) {
+    return scalarText;
+  }
+
+  return {
+    $let: {
+      vars: {
+        valueType: { $type: input },
+        // Normalise both object properties and array values into one shape so
+        // the recursive expression is emitted once per level, not once per
+        // possible BSON container type.
+        entries: {
+          $switch: {
+            branches: [
+              {
+                case: { $eq: [{ $type: input }, "object"] },
+                then: {
+                  $map: {
+                    input: { $objectToArray: input },
+                    as: "entry",
+                    in: { key: "$$entry.k", value: "$$entry.v" },
+                  },
+                },
+              },
+              {
+                case: { $eq: [{ $type: input }, "array"] },
+                then: {
+                  $map: {
+                    input,
+                    as: "entry",
+                    in: { key: "", value: "$$entry" },
+                  },
+                },
+              },
+            ],
+            default: [],
+          },
+        },
+      },
+      in: {
+        $cond: [
+          { $in: ["$$valueType", ["object", "array"]] },
+          {
+            $reduce: {
+              input: "$$entries",
+              initialValue: "",
+              in: {
+                $concat: [
+                  "$$value",
+                  " ",
+                  "$$this.key",
+                  " ",
+                  searchableTextExpression("$$this.value", depth - 1),
+                ],
+              },
+            },
+          },
+          scalarText,
+        ],
+      },
+    },
+  };
 }
 
 function searchStages(q: string | undefined): Document[] {
@@ -255,65 +427,11 @@ function searchStages(q: string | undefined): Document[] {
   return [
     {
       $addFields: {
-        _searchDescription: {
-          $let: {
-            vars: { descriptionType: { $type: "$asset_description" } },
-            in: {
-              $cond: [
-                { $eq: ["$$descriptionType", "object"] },
-                {
-                  $reduce: {
-                    input: { $objectToArray: "$asset_description" },
-                    initialValue: "",
-                    in: {
-                      $concat: [
-                        "$$value",
-                        " ",
-                        "$$this.k",
-                        " ",
-                        {
-                          $convert: {
-                            input: "$$this.v",
-                            to: "string",
-                            onError: "",
-                            onNull: "",
-                          },
-                        },
-                      ],
-                    },
-                  },
-                },
-                {
-                  $convert: {
-                    input: "$asset_description",
-                    to: "string",
-                    onError: "",
-                    onNull: "",
-                  },
-                },
-              ],
-            },
-          },
-        },
+        _searchDocumentText: searchableTextExpression("$$ROOT", SEARCH_DOCUMENT_MAX_DEPTH),
       },
     },
-    {
-      $match: {
-        $or: [
-          { name: safeRegex },
-          { lable: safeRegex },
-          { _searchDescription: safeRegex },
-          { "asset_description.category": safeRegex },
-          { "asset_description.type": safeRegex },
-          { "asset_description.name": safeRegex },
-          { category: safeRegex },
-          { type: safeRegex },
-          { code: safeRegex },
-          { client_code: safeRegex },
-          { employer: safeRegex },
-        ],
-      },
-    },
+    { $match: { _searchDocumentText: safeRegex } },
+    { $unset: "_searchDocumentText" },
   ];
 }
 
@@ -676,6 +794,259 @@ export async function getProjectOverview(projectId: ObjectId) {
   };
 }
 
+type InsightMetric = {
+  total: number;
+  completedToday: number;
+  present: number;
+  completed: number;
+  unobserved: number;
+  incomplete: number;
+};
+
+function startOfRiyadhDay(date: Date): Date {
+  // Asia/Riyadh is permanently UTC+03:00 and does not observe daylight saving.
+  const riyadhOffsetMs = 3 * 60 * 60 * 1000;
+  const riyadhDate = new Date(date.getTime() + riyadhOffsetMs);
+  return new Date(
+    Date.UTC(
+      riyadhDate.getUTCFullYear(),
+      riyadhDate.getUTCMonth(),
+      riyadhDate.getUTCDate(),
+    ) - riyadhOffsetMs,
+  );
+}
+
+function insightMetricStages(
+  match: Document,
+  startOfToday: Date,
+  startOfTomorrow: Date,
+): Document[] {
+  return [
+    { $match: match },
+    insightMetricGroup(startOfToday, startOfTomorrow),
+  ];
+}
+
+function insightMetricGroup(startOfToday: Date, startOfTomorrow: Date): Document {
+  const updatedAt = {
+    $convert: {
+      input: "$updatedAt",
+      to: "date",
+      onError: null,
+      onNull: null,
+    },
+  };
+
+  return {
+    $group: {
+        _id: null,
+        total: { $sum: 1 },
+        completedToday: {
+          $sum: {
+            $cond: [
+              {
+                $and: [
+                  { $eq: ["$isDone", true] },
+                  { $gte: [updatedAt, startOfToday] },
+                  { $lt: [updatedAt, startOfTomorrow] },
+                ],
+              },
+              1,
+              0,
+            ],
+          },
+        },
+        present: {
+          $sum: { $cond: [{ $eq: ["$isPresent", true] }, 1, 0] },
+        },
+        completed: {
+          $sum: { $cond: [{ $eq: ["$isDone", true] }, 1, 0] },
+        },
+        unobserved: {
+          $sum: { $cond: [{ $ne: ["$isPresent", true] }, 1, 0] },
+        },
+        incomplete: {
+          $sum: { $cond: [{ $ne: ["$isDone", true] }, 1, 0] },
+        },
+    },
+  };
+}
+
+function sourceMatch(source: string): Document {
+  return {
+    $expr: {
+      $eq: [{ $ifNull: ["$asset_source", "$source"] }, source],
+    },
+  };
+}
+
+function codeMatch(hasCode: boolean): Document {
+  const expression = hasCodeExpression();
+  return { $expr: hasCode ? expression : { $not: [expression] } };
+}
+
+function insightMetric(value: unknown): InsightMetric {
+  const metric = asRecord(recordArray(value)[0]);
+  return {
+    total: numberValue(metric.total),
+    completedToday: numberValue(metric.completedToday),
+    present: numberValue(metric.present),
+    completed: numberValue(metric.completed),
+    unobserved: numberValue(metric.unobserved),
+    incomplete: numberValue(metric.incomplete),
+  };
+}
+
+function conditionDistributionStages(match: Document): Document[] {
+  return [
+    { $match: match },
+    {
+      $group: {
+        _id: { $ifNull: ["$condition", UNKNOWN_VALUE] },
+        count: { $sum: 1 },
+      },
+    },
+    { $sort: { count: -1, _id: 1 } },
+  ];
+}
+
+function locationDistributionStages(match: Document): Document[] {
+  return [
+    { $match: match },
+    { $project: { _location: normalizedLocationExpression() } },
+    { $match: { _location: { $type: "string", $ne: "" } } },
+    { $group: { _id: "$_location", count: { $sum: 1 } } },
+    { $sort: { count: -1, _id: 1 } },
+  ];
+}
+
+function insightMetricFilters(filters: AssetQueryFilters): AssetQueryFilters {
+  return {
+    ...filters,
+    folderId: undefined,
+    folderIds: [],
+    locations: [],
+    updatedFrom: undefined,
+    updatedTo: undefined,
+  };
+}
+
+function conditionDistributionFilters(filters: AssetQueryFilters): AssetQueryFilters {
+  return { ...filters, folderId: undefined, folderIds: [] };
+}
+
+/**
+ * Detailed, filter-aware metrics for the project insight cards. Folder scope
+ * do not react to folder, location, or period selection. The selected location
+ * and period deliberately apply only to the condition chart, while the
+ * location list stays available for changing that selection.
+ */
+export async function getProjectInsights(
+  projectId: ObjectId,
+  filters: AssetQueryFilters,
+) {
+  await getProjectForDefaultCompany(projectId);
+  const database = await getDatabase();
+  const metricFilters = insightMetricFilters(filters);
+  const conditionFilters = conditionDistributionFilters(filters);
+  const [metricMatch, conditionMatch, locationOptionsMatch] = await Promise.all([
+    buildAssetMatch(projectId, metricFilters),
+    buildAssetMatch(projectId, conditionFilters),
+    buildAssetMatch(projectId, metricFilters),
+  ]);
+  const startOfToday = startOfRiyadhDay(new Date());
+  const startOfTomorrow = new Date(startOfToday);
+  startOfTomorrow.setUTCDate(startOfTomorrow.getUTCDate() + 1);
+
+  const aggregation = await database
+    .collection<Document>(COLLECTION.assets)
+    .aggregate(
+      [
+        {
+          $facet: {
+            all: insightMetricStages(metricMatch, startOfToday, startOfTomorrow),
+            client: [
+              { $match: metricMatch },
+              { $match: sourceMatch("عميل") },
+              insightMetricGroup(startOfToday, startOfTomorrow),
+            ],
+            applicationWithoutCode: [
+              { $match: metricMatch },
+              { $match: sourceMatch("تطبيق") },
+              { $match: codeMatch(false) },
+              insightMetricGroup(startOfToday, startOfTomorrow),
+            ],
+            applicationWithCode: [
+              { $match: metricMatch },
+              { $match: sourceMatch("تطبيق") },
+              { $match: codeMatch(true) },
+              insightMetricGroup(startOfToday, startOfTomorrow),
+            ],
+            conditionDistribution: conditionDistributionStages(conditionMatch),
+            locations: locationDistributionStages(locationOptionsMatch),
+          },
+        },
+      ],
+      QUERY_OPTIONS,
+    )
+    .next();
+
+  const result = asRecord(aggregation);
+  return {
+    metrics: {
+      all: insightMetric(result.all),
+      client: insightMetric(result.client),
+      applicationWithoutCode: insightMetric(result.applicationWithoutCode),
+      applicationWithCode: insightMetric(result.applicationWithCode),
+    },
+    conditionDistribution: distribution(result.conditionDistribution),
+    locations: optionValues(result.locations),
+  };
+}
+
+/** Aggregate one metric card across the union of selected folder trees. */
+export async function getProjectFolderMetrics(
+  projectId: ObjectId,
+  filters: AssetQueryFilters,
+) {
+  await getProjectForDefaultCompany(projectId);
+  const configuredFolderIds = Array.isArray(filters.folderIds) ? filters.folderIds : [];
+  const requestedFolderIds = configuredFolderIds.length > 0
+    ? configuredFolderIds
+    : filters.folderId ? [filters.folderId] : [];
+
+  if (requestedFolderIds.length === 0) {
+    throw new ValidationError("folderId is required.");
+  }
+
+  const folderIds = await resolveFolderIds(
+    projectId,
+    requestedFolderIds,
+    filters.includeDescendants,
+  );
+  const startOfToday = startOfRiyadhDay(new Date());
+  const startOfTomorrow = new Date(startOfToday);
+  startOfTomorrow.setUTCDate(startOfTomorrow.getUTCDate() + 1);
+  const database = await getDatabase();
+  const aggregate = await database
+    .collection<Document>(COLLECTION.assets)
+    .aggregate(
+      [
+        {
+          $match: {
+            ...assetBaseMatch(projectId),
+            parent: { $in: folderIds },
+          },
+        },
+        insightMetricGroup(startOfToday, startOfTomorrow),
+      ],
+      QUERY_OPTIONS,
+    )
+    .next();
+
+  return { metric: insightMetric(aggregate ? [aggregate] : []) };
+}
+
 export async function getProjectAssets(
   projectId: ObjectId,
   filters: AssetQueryFilters,
@@ -794,6 +1165,7 @@ function folderOption(folder: PlainRecord) {
     id: idValue(folder._id),
     name: stringOrNull(folder.name) ?? "بدون اسم",
     parentId: idValue(folder.parent),
+    createdAt: dateValue(folder.createdAt),
     path: [...ancestors, { id: idValue(folder._id), name: stringOrNull(folder.name) ?? "بدون اسم" }],
   };
 }
@@ -818,6 +1190,7 @@ export async function getProjectFilterOptions(
               categories: optionFacet("category"),
               types: typeOptionFacet(categories),
               employers: optionFacet("employer"),
+              locations: locationDistributionStages({}),
             },
           },
         ],
@@ -826,10 +1199,22 @@ export async function getProjectFilterOptions(
       .next(),
     database
       .collection<Document>(COLLECTION.items)
-      .aggregate(
-        [
-          { $match: { projectId } },
-          { $sort: { name: 1, _id: 1 } },
+        .aggregate(
+          [
+            { $match: { projectId } },
+          {
+            $addFields: {
+              _createdAtSort: {
+                $convert: {
+                  input: "$createdAt",
+                  to: "date",
+                  onError: null,
+                  onNull: null,
+                },
+              },
+            },
+          },
+          { $sort: { _createdAtSort: 1, _id: 1 } },
           { $limit: env.filterOptionsLimit },
           {
             $graphLookup: {
@@ -843,7 +1228,7 @@ export async function getProjectFilterOptions(
               maxDepth: 20,
             },
           },
-          { $project: { _id: 1, name: 1, parent: 1, ancestors: 1 } },
+          { $project: { _id: 1, name: 1, parent: 1, createdAt: 1, ancestors: 1 } },
         ],
         QUERY_OPTIONS,
       )
@@ -857,6 +1242,7 @@ export async function getProjectFilterOptions(
     categories: optionValues(result.categories),
     types: typeOptionValues(result.types),
     employers: optionValues(result.employers),
+    locations: optionValues(result.locations),
     folders: folders.map((folder) => folderOption(asRecord(folder))),
     optionLimit: env.filterOptionsLimit,
   };
