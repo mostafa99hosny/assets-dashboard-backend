@@ -96,6 +96,25 @@ function singleString(value: QueryValue, name: string): string | undefined {
   return values[0];
 }
 
+/**
+ * Search is a single literal phrase, unlike repeatable filters such as
+ * `source` and `category`. Keep commas intact so document values like
+ * "Model A, Series B" remain searchable as written by the user.
+ */
+function searchPhrase(value: QueryValue, name: string): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const rawValues = typeof value === "string" ? [value] : isStringArray(value) ? value : undefined;
+  if (!rawValues || rawValues.length !== 1) {
+    throw new ValidationError(`${name} accepts one value only.`);
+  }
+
+  const phrase = rawValues[0]?.trim();
+  return phrase || undefined;
+}
+
 function positiveInteger(
   value: QueryValue,
   name: string,
@@ -159,7 +178,7 @@ export function parseObjectId(value: unknown, name: string): ObjectId {
 }
 
 export function parseAssetFilters(query: Record<string, QueryValue>): AssetQueryFilters {
-  const q = singleString(query.q ?? query.search, "q");
+  const q = searchPhrase(query.q ?? query.search, "q");
   if (q && q.length > 100) {
     throw new ValidationError("q must be 100 characters or fewer.");
   }

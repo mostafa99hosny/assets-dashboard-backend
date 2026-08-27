@@ -213,7 +213,7 @@ Canonical query parameters:
 
 | Parameter | Meaning |
 | --- | --- |
-| `q` | Case-insensitive literal search (maximum 100 characters). Searches scalar name, `lable`, string/object description, category, type, codes, and employer fields. |
+| `q` | Case-insensitive literal search (maximum 100 characters). Searches the full `assets` document, including nested objects and arrays such as `rawData`, `normalizedData`, descriptions, notes, and image metadata. Commas are treated as part of the search phrase, not as filter separators. |
 | `source`, `condition`, `category`, `type`, `employer` | Repeatable or comma-separated exact filters. |
 | `isPresent`, `isDone`, `hasNotes` | `true` or `false`; omit for all. |
 | `status` | Repeatable/comma-separated exact workflow/import status, e.g. `pending_review`. |
